@@ -112,9 +112,10 @@ def train(args):
                 start = time.time()
                 x, y = data_loader.next_batch()
                 feed = {model.input_data: x, model.targets: y}
-                for i, (c, h) in enumerate(model.initial_state):
+                for i, (c, h, z) in enumerate(model.initial_state):
                     feed[c] = state[i].c
                     feed[h] = state[i].h
+                    feed[z] = state[i].z
                 train_loss, state, _ = sess.run([model.cost, model.final_state, model.train_op], feed)
 
                 # instrument for tensorboard

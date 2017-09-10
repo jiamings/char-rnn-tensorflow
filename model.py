@@ -1,7 +1,7 @@
 import tensorflow as tf
-from tensorflow.contrib import rnn
+# from tensorflow.contrib import rnn
 from tensorflow.contrib import legacy_seq2seq
-
+from rnn import HierarchicalMultiscaleRNNCell
 import numpy as np
 
 
@@ -12,37 +12,39 @@ class Model():
             args.batch_size = 1
             args.seq_length = 1
 
-        if args.model == 'rnn':
-            cell_fn = rnn.BasicRNNCell
-        elif args.model == 'gru':
-            cell_fn = rnn.GRUCell
-        elif args.model == 'lstm':
-            cell_fn = rnn.BasicLSTMCell
-        elif args.model == 'nas':
-            cell_fn = rnn.NASCell
-        else:
-            raise Exception("model type not supported: {}".format(args.model))
+        # if args.model == 'rnn':
+        #     cell_fn = tf.contrib.rnn.BasicRNNCell
+        # elif args.model == 'gru':
+        #     cell_fn = tf.contrib.rnn.GRUCell
+        # elif args.model == 'lstm':
+        #     cell_fn = tf.contrib.rnn.BasicLSTMCell
+        # elif args.model == 'nas':
+        #     cell_fn = tf.contrib.rnn.NASCell
+        # else:
+        #     raise Exception("model type not supported: {}".format(args.model))
 
-        cells = []
-        for _ in range(args.num_layers):
-            cell = cell_fn(args.rnn_size)
-            if training and (args.output_keep_prob < 1.0 or args.input_keep_prob < 1.0):
-                cell = rnn.DropoutWrapper(cell,
-                                          input_keep_prob=args.input_keep_prob,
-                                          output_keep_prob=args.output_keep_prob)
-            cells.append(cell)
+        # cells = []
+        # for _ in range(args.num_layers):
+        #     cell = cell_fn(args.rnn_size)
+        #     if training and (args.output_keep_prob < 1.0 or args.input_keep_prob < 1.0):
+        #         cell = tf.contrib.rnn.DropoutWrapper(cell,
+        #                                   input_keep_prob=args.input_keep_prob,
+        #                                   output_keep_prob=args.output_keep_prob)
+        #     cells.append(cell)
 
-        self.cell = cell = rnn.MultiRNNCell(cells, state_is_tuple=True)
+        # self.cell = cell = rnn.MultiRNNCell(cells, state_is_tuple=True)
+
+        cell = HierarchicalMultiscaleRNNCell(num_units=args.rnn_size, num_layers=args.num_layers, layer_norm=True)
+        self.cell = cell = tf.contrib.rnn.MultiRNNCell([cell], state_is_tuple=True)
 
         self.input_data = tf.placeholder(
             tf.int32, [args.batch_size, args.seq_length])
         self.targets = tf.placeholder(
             tf.int32, [args.batch_size, args.seq_length])
         self.initial_state = cell.zero_state(args.batch_size, tf.float32)
-
         with tf.variable_scope('rnnlm'):
             softmax_w = tf.get_variable("softmax_w",
-                                        [args.rnn_size, args.vocab_size])
+                                        [args.rnn_size * args.num_layers, args.vocab_size])
             softmax_b = tf.get_variable("softmax_b", [args.vocab_size])
 
         embedding = tf.get_variable("embedding", [args.vocab_size, args.rnn_size])
@@ -60,9 +62,10 @@ class Model():
             prev_symbol = tf.stop_gradient(tf.argmax(prev, 1))
             return tf.nn.embedding_lookup(embedding, prev_symbol)
 
-        outputs, last_state = legacy_seq2seq.rnn_decoder(inputs, self.initial_state, cell, loop_function=loop if not training else None, scope='rnnlm')
-        output = tf.reshape(tf.concat(outputs, 1), [-1, args.rnn_size])
-
+        outputs, last_state = legacy_seq2seq.rnn_decoder(
+            inputs, self.initial_state,
+            cell, loop_function=loop if not training else None, scope='rnnlm')
+        output = tf.reshape(tf.concat(outputs, 1), [-1, args.rnn_size * args.num_layers])
 
         self.logits = tf.matmul(output, softmax_w) + softmax_b
         self.probs = tf.nn.softmax(self.logits)
