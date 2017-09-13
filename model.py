@@ -1,7 +1,7 @@
 import tensorflow as tf
 # from tensorflow.contrib import rnn
 from tensorflow.contrib import legacy_seq2seq
-from rnn import HierarchicalMultiscaleRNNCell
+from tf_utils.rnn import HierarchicalMultiscaleRNNCell
 import numpy as np
 
 
@@ -34,7 +34,7 @@ class Model():
 
         # self.cell = cell = rnn.MultiRNNCell(cells, state_is_tuple=True)
 
-        cell = HierarchicalMultiscaleRNNCell(num_units=args.rnn_size, num_layers=args.num_layers, layer_norm=True)
+        cell = HierarchicalMultiscaleRNNCell(num_units=[args.rnn_size for _ in range(args.num_layers)], layer_norm=True)
         self.cell = cell = tf.contrib.rnn.MultiRNNCell([cell], state_is_tuple=True)
 
         self.input_data = tf.placeholder(

@@ -1,5 +1,6 @@
 import collections
 
+import numpy as np
 import tensorflow as tf
 
 from tf_utils.nn import binary_stochastic_neuron_straight_through, bernoulli_sample
@@ -20,7 +21,7 @@ class HMRNNStateTuple(_HMRNNStateTuple):
 
 
 class HierarchicalMultiscaleRNNCell(tf.nn.rnn_cell.RNNCell):
-    def __init__(self, num_units, num_layers, layer_norm, reuse=None):
+    def __init__(self, num_units, layer_norm, *, moving_slope=False, reuse=None):
         """
         Initialization.
         :param num_units: a tuple, which contains the # of neurons at each layer.
@@ -28,34 +29,35 @@ class HierarchicalMultiscaleRNNCell(tf.nn.rnn_cell.RNNCell):
         """
         super(HierarchicalMultiscaleRNNCell, self).__init__(_reuse=reuse)
         self._num_units = num_units
-        self._num_layers = num_layers
+        self._total_units = np.sum(num_units)
+        self._num_layers = len(num_units)
         self._layer_norm = layer_norm
-        self.slope = 1.0  # self.slope = tf.placeholder(dtype=tf.float32, shape=[], name='slope')
+        self.slope = tf.placeholder(dtype=tf.float32, shape=[], name='slope') if moving_slope else 1.0
 
     @property
     def state_size(self):
         return HMRNNStateTuple(
-            self._num_units * self._num_layers,
-            self._num_units * self._num_layers,
+            self._total_units,
+            self._total_units,
             self._num_layers)
 
     @property
     def output_size(self):
-        return self._num_units * self._num_layers
+        return self._total_units
 
     def __call__(self, inputs, state):
         c, h, z = state
-        c = tf.unstack(tf.reshape(c, [-1, self._num_layers, self._num_units]), axis=1)
-        h = tf.unstack(tf.reshape(h, [-1, self._num_layers, self._num_units]), axis=1)
-        z = tf.unstack(tf.reshape(z, [-1, self._num_layers]), axis=1)
+        c = tf.split(c, self._num_units, axis=1)
+        h = tf.split(h, self._num_units, axis=1)
+        z = tf.split(z, self._num_layers, axis=1)
         new_c, new_h, new_z = [], [], []
         for l in range(0, self._num_layers):
             r = h[l]
             if l + 1 < self._num_layers:
-                r = tf.concat([r, h[l+1] * tf.expand_dims(z[l], axis=1)], axis=1)
-            r = tf.concat([r, inputs if l == 0 else new_h[l-1] * tf.expand_dims(new_z[l-1], axis=1)], axis=1)
-            cc = self._linear(r, 4 * self._num_units + 1, name='hmrnn_{}'.format(l))
-            f, i, o, g, nz = tf.split(cc, [self._num_units] * 4 + [1], axis=1)
+                r = tf.concat([r, h[l+1] * z[l]], axis=1)
+            r = tf.concat([r, inputs if l == 0 else new_h[l-1] * new_z[l-1]], axis=1)
+            cc = self._linear(r, 4 * self._num_units[l] + 1, name='hmrnn_{}'.format(l))
+            f, i, o, g, nz = tf.split(cc, [self._num_units[l]] * 4 + [1], axis=1)
             if self._layer_norm:
                 i = self._norm(i, 'input_{}'.format(l))
                 g = self._norm(g, 'transform_{}'.format(l))
@@ -63,26 +65,24 @@ class HierarchicalMultiscaleRNNCell(tf.nn.rnn_cell.RNNCell):
                 o = self._norm(o, 'output_{}'.format(l))
 
             i, f, o, g = tf.sigmoid(i), tf.sigmoid(f), tf.sigmoid(o), tf.tanh(g)
-            nz = tf.squeeze(binary_stochastic_neuron_straight_through(nz, slope=self.slope), axis=1)
+            nz = binary_stochastic_neuron_straight_through(nz, slope=self.slope)
             # nz = tf.zeros_like(z[0])
             if l > 0:
-                copy = tf.logical_and(tf.equal(new_z[l-1], 0.0), tf.equal(z[l], 0.0))
-                flush = tf.equal(z[l], 1.0)
-                update = tf.logical_and(tf.equal(new_z[l-1], 1.0), tf.equal(z[l], 0.0))
-
+                copy = tf.squeeze(tf.logical_and(tf.equal(new_z[l-1], 0.0), tf.equal(z[l], 0.0)), axis=1)
+                flush = tf.squeeze(tf.equal(z[l], 1.0), axis=1)
+                update = tf.squeeze(tf.logical_and(tf.equal(new_z[l-1], 1.0), tf.equal(z[l], 0.0)), axis=1)
                 nc = tf.where(flush, x=i * g, y=tf.where(update, x=f * c[l] + i * g, y=c[l]))
                 nh = tf.where(copy, x=h[l], y=o * tf.tanh(nc))
             else:
-                flush = tf.equal(z[l], 1.0)
+                flush = tf.squeeze(tf.equal(z[l], 1.0), axis=1)
                 nc = tf.where(flush, x=i * g, y=f * c[l] + i * g)
                 nh = o * tf.tanh(nc)
             new_c.append(nc)
             new_h.append(nh)
             new_z.append(nz)
-
-        new_c = tf.reshape(tf.stack(new_c, axis=1), [-1, self._num_layers * self._num_units])
-        new_h = tf.reshape(tf.stack(new_h, axis=1), [-1, self._num_layers * self._num_units])
-        new_z = tf.stack(new_z, axis=1)
+        new_c = tf.concat(new_c, axis=1)
+        new_h = tf.concat(new_h, axis=1)
+        new_z = tf.concat(new_z, axis=1)
         return new_h, HMRNNStateTuple(new_c, new_h, new_z)
 
     def _linear(self, x, num_outputs, name):
@@ -107,11 +107,11 @@ class HierarchicalMultiscaleRNNCell(tf.nn.rnn_cell.RNNCell):
         return normalized
 
 
-def gated_embedding_layer(x, num_outputs, num_layers, scope='gated_embedding', reuse=False):
+def gated_embedding_layer(x, num_outputs, num_units, scope='gated_embedding', reuse=False):
     batch_size = x.get_shape().as_list()[0]
     time_steps = x.get_shape().as_list()[1]
     x = tf.reshape(x, [batch_size * time_steps, -1])
-    x = tf.split(x, num_or_size_splits=num_layers, axis=1)
+    x = tf.split(x, num_or_size_splits=num_units, axis=1)
 
     with tf.variable_scope(scope, reuse=reuse):
         g = []
@@ -133,18 +133,21 @@ def gated_embedding_layer(x, num_outputs, num_layers, scope='gated_embedding', r
 
 
 if __name__ == '__main__':
-    num_units, num_layers, batch_size, time_steps, num_outputs = 1, 3, 10, 5, 15
+    num_units, num_layers, batch_size, time_steps, num_outputs = 2, 3, 10, 5, 15
+    num_units = [3, 2, 2]
     x = tf.random_uniform(shape=[batch_size, time_steps, 10])
-    cell = HierarchicalMultiscaleRNNCell(num_units=num_units, num_layers=num_layers, layer_norm=True)
+    cell = HierarchicalMultiscaleRNNCell(num_units=num_units, layer_norm=True)
     outputs, states = tf.nn.dynamic_rnn(
         cell, x, initial_state=HMRNNStateTuple(
-            c=tf.random_uniform(shape=[batch_size, num_layers * num_units], minval=-1.0, maxval=1.0),
-            h=tf.random_uniform(shape=[batch_size, num_layers * num_units], minval=-1.0, maxval=1.0),
-            z=bernoulli_sample(tf.random_uniform(shape=[batch_size, num_layers]))
+            c=tf.random_uniform(shape=[batch_size, sum(num_units)], minval=-1.0, maxval=1.0),
+            h=tf.random_uniform(shape=[batch_size, sum(num_units)], minval=-1.0, maxval=1.0),
+            z=bernoulli_sample(tf.random_uniform(shape=[batch_size, num_layers])),
         )
     )
-    logits = gated_embedding_layer(outputs, num_outputs, num_layers, scope='gated_embedding')
+    logits = gated_embedding_layer(outputs, num_outputs, num_units,
+                                   scope='gated_embedding')
     s = tf.Session()
     s.run(tf.global_variables_initializer())
-    lg = s.run(logits)
+    lg, opts = s.run([logits, outputs])
     print(lg.shape)
+    print(opts.shape)
